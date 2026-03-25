@@ -90,6 +90,8 @@ describe('auto-augment hook', () => {
     expect(result.content).toHaveLength(2);
     expect(result.content[1].text).toContain('[GitNexus');
     expect(result.content[1].text).toContain('Called by: login, signup');
+    // Verify --- delimiters
+    expect(result.content[1].text).toContain('---');
   });
 
   it('skips non-search tools', async () => {
@@ -122,25 +124,25 @@ describe('auto-augment hook', () => {
     expect(runAugmentMock).not.toHaveBeenCalled();
   });
 
-  it('deduplicates patterns within a session', async () => {
+  it('deduplicates patterns within a session (case-insensitive)', async () => {
     runAugmentMock.mockResolvedValue('context');
 
     const { default: register } = await import('../src/index');
     register(createPi() as any);
 
-    // First call — should augment
+    // First call — should augment (primary only, content has no secondary file patterns)
     await fireToolResult({
       toolName: 'grep',
       input: { pattern: 'validateUser' },
-      content: [{ type: 'text', text: 'match' }],
+      content: [{ type: 'text', text: 'found validateUser in codebase' }],
     });
     expect(runAugmentMock).toHaveBeenCalledTimes(1);
 
-    // Second call same pattern — should skip
+    // Second call same pattern different case — should skip
     const result = await fireToolResult({
       toolName: 'grep',
-      input: { pattern: 'validateUser' },
-      content: [{ type: 'text', text: 'match' }],
+      input: { pattern: 'ValidateUser' },
+      content: [{ type: 'text', text: 'found ValidateUser in codebase' }],
     });
     expect(runAugmentMock).toHaveBeenCalledTimes(1);
     expect(result).toBeUndefined();
@@ -155,10 +157,33 @@ describe('auto-augment hook', () => {
     const result = await fireToolResult({
       toolName: 'grep',
       input: { pattern: 'somethingNew' },
-      content: [{ type: 'text', text: 'match' }],
+      content: [{ type: 'text', text: 'src/auth.ts:1:match' }],
     });
 
     expect(result).toBeUndefined();
+  });
+
+  it('caches empty results and skips on second attempt', async () => {
+    runAugmentMock.mockResolvedValue('');
+
+    const { default: register } = await import('../src/index');
+    register(createPi() as any);
+
+    // First call — augment returns empty, cached in emptyCache (no secondary patterns)
+    await fireToolResult({
+      toolName: 'grep',
+      input: { pattern: 'emptySymbol' },
+      content: [{ type: 'text', text: 'found emptySymbol in codebase' }],
+    });
+    expect(runAugmentMock).toHaveBeenCalledTimes(1);
+
+    // Second call — should skip (in emptyCache)
+    await fireToolResult({
+      toolName: 'grep',
+      input: { pattern: 'emptySymbol' },
+      content: [{ type: 'text', text: 'found emptySymbol in codebase' }],
+    });
+    expect(runAugmentMock).toHaveBeenCalledTimes(1);
   });
 
   it('augments read tool with file basename', async () => {
@@ -170,7 +195,7 @@ describe('auto-augment hook', () => {
     const result = await fireToolResult({
       toolName: 'read',
       input: { path: '/repo/src/validator.ts' },
-      content: [{ type: 'text', text: 'file contents' }],
+      content: [{ type: 'text', text: 'file contents here' }],
     });
 
     expect(runAugmentMock).toHaveBeenCalledWith('validator', '/repo-root');
@@ -179,9 +204,7 @@ describe('auto-augment hook', () => {
   });
 
   it('extracts secondary patterns from grep output', async () => {
-    runAugmentMock
-      .mockResolvedValueOnce('primary context')
-      .mockResolvedValueOnce('secondary context');
+    runAugmentMock.mockResolvedValue('context for symbol');
 
     const { default: register } = await import('../src/index');
     register(createPi() as any);
@@ -192,8 +215,22 @@ describe('auto-augment hook', () => {
       content: [{ type: 'text', text: 'src/auth/handler.ts:10:authenticate()\nsrc/utils/validator.ts:5:check()' }],
     });
 
-    // Should have called augment for primary + secondary file pattern
+    // Should have called augment for primary + secondary file patterns
     expect(runAugmentMock.mock.calls.length).toBeGreaterThanOrEqual(1);
     expect(result).toBeDefined();
+  });
+
+  it('skips enrichment when tool content is too short', async () => {
+    const { default: register } = await import('../src/index');
+    register(createPi() as any);
+
+    const result = await fireToolResult({
+      toolName: 'grep',
+      input: { pattern: 'validateUser' },
+      content: [{ type: 'text', text: '' }],
+    });
+
+    expect(result).toBeUndefined();
+    expect(runAugmentMock).not.toHaveBeenCalled();
   });
 });

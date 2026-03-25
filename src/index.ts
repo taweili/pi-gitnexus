@@ -52,10 +52,17 @@ let augmentHits = 0;
 let hookFires = 0;
 
 /**
- * Patterns already augmented this session.
+ * Patterns already augmented this session (with non-empty results).
  * Prevents the same symbol/file from being looked up repeatedly.
+ * Keys are lowercased for case-insensitive dedup.
  */
 const augmentedCache = new Set<string>();
+
+/**
+ * Patterns that returned empty results on first attempt.
+ * Prevents unbounded retries. Cleared on session reset (index rebuild).
+ */
+const emptyCache = new Set<string>();
 
 export default function(pi: ExtensionAPI) {
   registerTools(pi);
@@ -92,26 +99,39 @@ export default function(pi: ExtensionAPI) {
     // read_many: per-file labeled context so the agent knows which context belongs to which file.
     if (event.toolName === 'read_many') {
       const files = extractFilesFromReadMany(event.input, event.content);
-      const fresh = files.filter(f => !augmentedCache.has(f.pattern)).slice(0, 5);
+      const fresh = files.filter(f => {
+        const key = f.pattern.toLowerCase();
+        return !augmentedCache.has(key) && !emptyCache.has(key);
+      }).slice(0, 5);
       if (fresh.length === 0) return;
-      for (const f of fresh) augmentedCache.add(f.pattern);
       const results = await Promise.all(fresh.map(f => runAugment(f.pattern, cwd).then(out => ({ f, out }))));
+      // Cache based on results: successful → augmentedCache, empty → emptyCache
+      for (const r of results) {
+        const key = r.f.pattern.toLowerCase();
+        if (r.out) { augmentedCache.add(key); } else { emptyCache.add(key); }
+      }
       const sections = results.filter(r => r.out);
       if (sections.length === 0) return;
       augmentHits++;
-      const label = sections.length === 1
-        ? `[GitNexus: ${sections[0].f.path.split('/').pop()}]`
-        : '[GitNexus]';
       const body = sections.length === 1
         ? sections[0].out
         : sections.map(({ f, out }) => `### ${f.path.split('/').pop()}\n${out}`).join('\n\n');
+      const label = body.startsWith('[GitNexus]') ? '' : (
+        sections.length === 1
+          ? `[GitNexus: ${sections[0].f.path.split('/').pop()}]\n`
+          : '[GitNexus]\n'
+      );
       return {
         content: [
           ...event.content,
-          { type: 'text' as const, text: `\n\n${label}\n${body}` },
+          { type: 'text' as const, text: `\n\n---\n${label}${body}\n---` },
         ],
       };
     }
+
+    // Early-exit: skip enrichment when the tool returned no meaningful content.
+    const contentText = event.content.map((c: { type: string; text?: string }) => c.text ?? '').join('');
+    if (contentText.length < 10) return;
 
     // Collect patterns: primary from input, secondary filenames from result content.
     const primary = extractPattern(event.toolName, event.input);
@@ -121,23 +141,31 @@ export default function(pi: ExtensionAPI) {
       : [];
     const candidates = [...new Set([primary, ...secondary].filter((p): p is string => !!p))];
 
-    // Filter patterns already augmented this session.
-    const fresh = candidates.filter(p => !augmentedCache.has(p));
+    // Filter patterns already augmented or known-empty this session (case-insensitive).
+    const fresh = candidates.filter(p => {
+      const key = p.toLowerCase();
+      return !augmentedCache.has(key) && !emptyCache.has(key);
+    });
     if (fresh.length === 0) return;
 
     // Run augments in parallel, merge results.
     const maxAugments = cfg.maxAugmentsPerResult ?? 3;
     const toRun = fresh.slice(0, maxAugments);
-    for (const p of toRun) augmentedCache.add(p);
-    const results = await Promise.all(toRun.map(p => runAugment(p, cwd)));
-    const combined = results.filter(Boolean).join('\n\n');
+    const results = await Promise.all(toRun.map(p => runAugment(p, cwd).then(out => ({ p, out }))));
+    // Cache based on results: successful → augmentedCache, empty → emptyCache
+    for (const r of results) {
+      const key = r.p.toLowerCase();
+      if (r.out) { augmentedCache.add(key); } else { emptyCache.add(key); }
+    }
+    const combined = results.filter(r => r.out).map(r => r.out).join('\n\n');
     if (!combined) return;
 
     augmentHits++;
+    const label = combined.startsWith('[GitNexus]') ? '' : `[GitNexus: ${toRun.join(', ')}]\n`;
     return {
       content: [
         ...event.content,
-        { type: 'text' as const, text: `\n\n[GitNexus: ${toRun.join(', ')}]\n${combined}` },
+        { type: 'text' as const, text: `\n\n---\n${label}${combined}\n---` },
       ],
     };
   });
@@ -148,6 +176,7 @@ export default function(pi: ExtensionAPI) {
     augmentHits = 0;
     hookFires = 0;
     augmentedCache.clear();
+    emptyCache.clear();
     sessionCwd = ctx.cwd;
     await resolveShellPath();
 

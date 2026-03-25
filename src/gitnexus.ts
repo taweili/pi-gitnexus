@@ -109,6 +109,75 @@ const CODE_EXTENSIONS = new Set([
 ]);
 
 /**
+ * Extract the longest identifier-like literal from a regex pattern.
+ * Splits on metacharacters, returns the longest segment that looks like
+ * a code identifier (>= 3 chars, starts with letter/underscore).
+ */
+export function extractLiteralFromRegex(raw: string): string | null {
+  const segments = raw.split(/[\\^$.*+?()[\]{}|]+/);
+  let best: string | null = null;
+  for (const seg of segments) {
+    const clean = seg.replace(/['"]/g, '');
+    if (clean.length >= 3 && /^[a-zA-Z_]\w*$/.test(clean)) {
+      if (!best || clean.length > best.length) best = clean;
+    }
+  }
+  return best;
+}
+
+/**
+ * Simple shell-aware tokenizer for bash commands.
+ * Respects single/double quotes. Inserts a '|' boundary token at
+ * pipe, &&, ||, and ; boundaries so extractPattern can reset state.
+ */
+function tokenizeBashCmd(cmd: string): string[] {
+  const tokens: string[] = [];
+  let current = '';
+  let inSingle = false;
+  let inDouble = false;
+
+  const flush = () => { if (current) { tokens.push(current); current = ''; } };
+
+  for (let i = 0; i < cmd.length; i++) {
+    const ch = cmd[i];
+
+    if (inSingle) {
+      if (ch === "'") { inSingle = false; } else { current += ch; }
+      continue;
+    }
+    if (inDouble) {
+      if (ch === '"') { inDouble = false; } else { current += ch; }
+      continue;
+    }
+
+    // Command boundaries: |, &&, ||, ;
+    if (ch === '|' || ch === ';') {
+      flush();
+      tokens.push('|'); // boundary marker
+      if (ch === '|' && cmd[i + 1] === '|') i++; // skip ||
+      continue;
+    }
+    if (ch === '&' && cmd[i + 1] === '&') {
+      flush();
+      tokens.push('|'); // boundary marker
+      i++; // skip second &
+      continue;
+    }
+
+    if (ch === "'") { inSingle = true; continue; }
+    if (ch === '"') { inDouble = true; continue; }
+
+    if (/\s/.test(ch)) {
+      flush();
+    } else {
+      current += ch;
+    }
+  }
+  flush();
+  return tokens;
+}
+
+/**
  * Extract the primary search pattern from a tool's input object.
  *
  * grep  → input.pattern
@@ -123,8 +192,7 @@ export function extractPattern(toolName: string, input: Record<string, unknown>)
 
   if (toolName === 'grep') {
     const raw = typeof input.pattern === 'string' ? input.pattern : null;
-    // Strip regex metacharacters — gitnexus augment expects a plain symbol/identifier name.
-    pattern = raw ? raw.replace(/[\\^$.*+?()[\]{}|]/g, '') : null;
+    pattern = raw ? extractLiteralFromRegex(raw) : null;
   } else if (toolName === 'find') {
     // pi's find tool field name is unconfirmed — try common variants
     const raw =
@@ -138,18 +206,20 @@ export function extractPattern(toolName: string, input: Record<string, unknown>)
     }
   } else if (toolName === 'bash') {
     const cmd = typeof input.command === 'string' ? input.command : '';
-    const tokens = cmd.split(/\s+/);
+    const tokens = tokenizeBashCmd(cmd);
     let foundCmd = false;
     let foundFileCmd = false;
     for (let i = 0; i < tokens.length; i++) {
       const tok = tokens[i];
 
+      // Reset state at command boundaries (pipe, &&, ||, ;)
+      if (tok === '|') { foundCmd = false; foundFileCmd = false; continue; }
+
       // grep/rg: first non-flag arg after the command is the search pattern
       if (tok === 'grep' || tok === 'rg') { foundCmd = true; foundFileCmd = false; continue; }
       if (foundCmd) {
         if (tok.startsWith('-')) continue;
-        // Strip quotes and regex metacharacters — gitnexus augment expects a plain symbol name.
-        pattern = tok.replace(/['"]/g, '').replace(/[\\^$.*+?()[\]{}|]/g, '');
+        pattern = extractLiteralFromRegex(tok);
         break;
       }
 
@@ -159,19 +229,20 @@ export function extractPattern(toolName: string, input: Record<string, unknown>)
       }
       if (foundFileCmd) {
         if (tok.startsWith('-')) continue;
-        const unquoted = tok.replace(/['"]/g, '');
-        const ext = extname(unquoted);
+        const ext = extname(tok);
         if (CODE_EXTENSIONS.has(ext)) {
-          pattern = basename(unquoted).replace(/\.\w+$/, '');
+          pattern = basename(tok).replace(/\.\w+$/, '');
+          break;
         }
-        break;
+        // Non-code file — reset and keep scanning for grep/rg in later segments.
+        foundFileCmd = false;
+        continue;
       }
 
       // find -name / -iname: strip glob chars and extension from value
       if (tok === 'find') { foundCmd = false; foundFileCmd = false; continue; }
       if ((tok === '-name' || tok === '-iname') && tokens[i + 1]) {
-        const unquoted = tokens[i + 1].replace(/['"]/g, '');
-        const seg = basename(unquoted).replace(/\.\w+$/, '').replace(/[*?[\]{}]/g, '');
+        const seg = basename(tokens[i + 1]).replace(/\.\w+$/, '').replace(/[*?[\]{}]/g, '');
         if (seg.length >= 3) { pattern = seg; }
         break;
       }

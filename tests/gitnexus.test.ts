@@ -5,6 +5,7 @@ import { homedir, tmpdir } from 'os';
 import {
   expandUserPath,
   extractFilesFromReadMany,
+  extractLiteralFromRegex,
   extractPattern,
   findGitNexusRoot,
   normalizePathArg,
@@ -65,5 +66,87 @@ describe('gitnexus helpers', () => {
     expect(validateRepoRelativePath('../etc/passwd')).toBeNull();
     expect(validateRepoRelativePath('/etc/passwd')).toBeNull();
     expect(validateRepoRelativePath('')).toBeNull();
+  });
+});
+
+describe('extractLiteralFromRegex', () => {
+  it('returns plain identifiers unchanged', () => {
+    expect(extractLiteralFromRegex('validateUser')).toBe('validateUser');
+    expect(extractLiteralFromRegex('foo_bar')).toBe('foo_bar');
+  });
+
+  it('extracts longest literal from regex with metacharacters', () => {
+    // Foo, Bar, Baz are all 3 chars — Foo is found first
+    expect(extractLiteralFromRegex('(Foo|Bar)Baz')).toBe('Foo');
+    expect(extractLiteralFromRegex('foo\\.bar')).toBe('foo');
+    expect(extractLiteralFromRegex('^export\\s+function\\s+(\\w+)')).toBe('function');
+  });
+
+  it('handles alternation — picks longest branch', () => {
+    expect(extractLiteralFromRegex('(validateUser|check)')).toBe('validateUser');
+  });
+
+  it('returns null for patterns with no valid identifier', () => {
+    expect(extractLiteralFromRegex('.*')).toBeNull();
+    expect(extractLiteralFromRegex('^$')).toBeNull();
+    expect(extractLiteralFromRegex('ab')).toBeNull(); // too short
+  });
+
+  it('strips surrounding quotes', () => {
+    expect(extractLiteralFromRegex('"validateUser"')).toBe('validateUser');
+    expect(extractLiteralFromRegex("'authenticate'")).toBe('authenticate');
+  });
+});
+
+describe('extractPattern — grep', () => {
+  it('extracts literal from simple pattern', () => {
+    expect(extractPattern('grep', { pattern: 'validateUser' })).toBe('validateUser');
+  });
+
+  it('extracts literal from regex pattern', () => {
+    expect(extractPattern('grep', { pattern: '(Foo|Bar)' })).toBe('Foo');
+    expect(extractPattern('grep', { pattern: 'foo\\.bar' })).toBe('foo');
+  });
+
+  it('returns null for pure metacharacter patterns', () => {
+    expect(extractPattern('grep', { pattern: '.*' })).toBeNull();
+  });
+});
+
+describe('extractPattern — bash with quotes and pipes', () => {
+  it('extracts pattern from quoted grep args', () => {
+    expect(extractPattern('bash', { command: 'grep "validateUser" src/' })).toBe('validateUser');
+    expect(extractPattern('bash', { command: "grep 'authenticate' src/" })).toBe('authenticate');
+  });
+
+  it('handles piped commands — only parses the grep segment', () => {
+    expect(extractPattern('bash', { command: 'grep validateUser src/ | head -5' })).toBe('validateUser');
+    expect(extractPattern('bash', { command: 'cat file.txt | grep validateUser' })).toBe('validateUser');
+  });
+
+  it('handles && chained commands', () => {
+    expect(extractPattern('bash', { command: 'cd src && grep validateUser *.ts' })).toBe('validateUser');
+  });
+
+  it('extracts file basename from cat with quoted path', () => {
+    expect(extractPattern('bash', { command: 'cat "src/validator.ts"' })).toBe('validator');
+  });
+});
+
+describe('extractPattern — read', () => {
+  it('extracts basename from code files', () => {
+    expect(extractPattern('read', { path: '/repo/src/validator.ts' })).toBe('validator');
+    expect(extractPattern('read', { path: '/repo/src/authenticate.py' })).toBe('authenticate');
+    expect(extractPattern('read', { path: '/repo/README.md' })).toBe('README');
+    expect(extractPattern('read', { path: '/repo/src/index.ts' })).toBe('index');
+  });
+
+  it('skips non-code files', () => {
+    expect(extractPattern('read', { path: '/repo/data.json' })).toBeNull();
+    expect(extractPattern('read', { path: '/repo/image.png' })).toBeNull();
+  });
+
+  it('skips basenames shorter than 3 chars', () => {
+    expect(extractPattern('read', { path: '/repo/src/ab.ts' })).toBeNull();
   });
 });
